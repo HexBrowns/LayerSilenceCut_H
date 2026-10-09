@@ -1,0 +1,30 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+#
+# ビルドと配布の設定（aviutl2-cli: https://github.com/sevenc-nanashi/aviutl2-cli）。
+#   au2 release   テストしてからビルドし、release/ に au2pkg を作る
+# project.version は Cargo.toml の version と揃える。
+# 公開する（ユーザーの決定、2026-10-09）。表示名は「レイヤー指定無音カット_H」、ID とリポジトリは LayerSilenceCut_H。
+
+[project]
+id = "HexBrowns.LayerSilenceCut_H"
+name = "LayerSilenceCut_H"
+version = "0.1.0"
+
+[artifacts."LayerSilenceCut_H.aux2"]
+build = "cargo build --release"
+source = "target/release/layer_silence_cut_h.dll"
+destination = "Plugin/LayerSilenceCut_H/LayerSilenceCut_H.aux2"
+
+[release]
+# テストの後、インストール時のダイアログに本体と依存クレートのライセンスを出す
+prebuild = [
+    "cargo test",
+    'copy /b /y LICENSE + THIRD_PARTY_CRATES.md release\package.txt >nul',
+]
+package_template = "release/package.txt"
+package_information = "レイヤー指定無音カット_H v{version} by HexBrowns"
+
+[catalog]
+id = "HexBrowns.LayerSilenceCut_H"
+license_path = { type = "MIT", path = "./LICENSE" }
+download_repo = { owner = "HexBrowns", repo = "LayerSilenceCut_H" }

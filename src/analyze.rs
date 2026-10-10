@@ -8,6 +8,10 @@
 //!
 //! 要求は 1 回の `call_edit_section` でまとめて出す（何も編集しない編集セクションが Undo に積まれるかは未確認なので、回数を増やさない）。
 //! 裏のスレッドはプラグインが外れる前に止めて待つ（`shutdown`。ルール au2-rs-plugin「裏のスレッド」）。
+//!
+//! **要求を出したら DLL を pin する**（`pin_module`）。中止しても、出した要求の結果のコールバック（この DLL のコード）は
+//! 本体に残る。解析中に本体を終了すると、DLL を外した後にそれが呼ばれて落ちうる。待ちが切れて裏のスレッドが残る場合も同じ
+//! （公開前チェックリストの点検、`issues/20261010_publish_checklist_audit.md`）。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -51,8 +55,32 @@ pub fn rms(l: &[f32], r: &[f32]) -> f64 {
     ((sl + sr) / (2.0 * l.len() as f64)).sqrt()
 }
 
+/// この DLL をプロセスが終わるまで外させない（`GetModuleHandleExW` の PIN）。何度呼んでもよい
+fn pin_module() {
+    static PINNED: AtomicBool = AtomicBool::new(false);
+    if PINNED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut std::ffi::c_void) -> i32;
+    }
+    let mut module = std::ptr::null_mut();
+    let addr = pin_module as *const () as *const u16;
+    // SAFETY: FROM_ADDRESS では `name` をこの DLL の中のアドレスとして読むだけ。`module` は書き込み先
+    let ok = unsafe {
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, addr, &mut module)
+    };
+    if ok == 0 {
+        tracing::warn!("[LayerSilenceCut_H] DLL を pin できませんでした（解析中に終了すると落ちることがあります）");
+    }
+}
+
 pub fn start(prepared: Arc<Prepared>) -> Arc<Progress> {
     shutdown();
+    pin_module();
     let progress = Arc::new(Progress {
         total: AtomicUsize::new(0),
         done: AtomicUsize::new(0),
@@ -79,7 +107,7 @@ pub fn shutdown() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    tracing::warn!("[LayerSilenceCut_H] 解析のスレッドが 5 秒で止まりませんでした");
+    tracing::warn!("[LayerSilenceCut_H] 解析のスレッドが 5 秒で止まりませんでした（DLL は pin してあるので落ちない）");
 }
 
 fn run(prepared: &Prepared, p: &Progress) -> Result<Levels, String> {
@@ -106,9 +134,14 @@ fn run(prepared: &Prepared, p: &Progress) -> Result<Levels, String> {
     let audio: Vec<_> = prepared.audio.iter().map(|o| o.handle).collect();
     let reqs = requests.clone();
     let sent = EDIT_HANDLE
-        .call_edit_section(move |_edit| {
+        .call_edit_section(move |edit| {
             let mut failed = 0;
             for (i, f) in reqs {
+                // 解析のボタンを押してからここまでの間に消えたオブジェクトには要求を出さない
+                if !edit.object(audio[i]).exists() {
+                    failed += 1;
+                    continue;
+                }
                 let tx = tx.clone();
                 if EDIT_HANDLE
                     .rendering_object_audio(audio[i], f as u32, true, move |a| {

@@ -19,7 +19,7 @@
 
 ## 導入
 
-1. [Releases](https://github.com/HexBrowns/LayerSilenceCut_H/releases) から `HexBrowns.LayerSilenceCut_H-v0.1.0.au2pkg.zip` をダウンロードし、AviUtl2 のプレビューへドラッグ&ドロップする
+1. [Releases](https://github.com/HexBrowns/LayerSilenceCut_H/releases) から `HexBrowns.LayerSilenceCut_H-v0.1.1.au2pkg.zip` をダウンロードし、AviUtl2 のプレビューへドラッグ&ドロップする
    （手で置くなら、中の `Plugin` フォルダをデータフォルダ `C:\ProgramData\aviutl2` へコピーする）
 2. AviUtl2 を再起動する
 3. **表示** メニュー → **レイヤー指定無音カット_H** でウィンドウを開く
@@ -69,6 +69,7 @@ python AI/tools/au2_build.py LayerSilenceCut_H
 
 - 判定はフレーム単位です（30 fps で 1 フレーム約 33 ms）。ms はフレーム数に四捨五入します
 - 設定は次回も引き継がれます（`Plugin\LayerSilenceCut_H\settings.json`）。**初期値に戻す** で戻せます
+- 設定ファイルが読めなかったときは、`settings.json.broken-（数字）` に名前を変えて残し、初期値で始めます（v0.1.1〜）
 - 項目名にマウスを乗せると説明が出ます
 
 ### 下の欄の高さ
@@ -104,5 +105,6 @@ python AI/tools/au2_build.py LayerSilenceCut_H
 - 設定を変えてやり直すときは、**先に Ctrl+Z でカット前に戻してから** 解析し直してください
 - 解析した後にタイムラインが変わったときは、カットせずに知らせます。解析し直してください
 - 再生中・ファイル出力中は解析もカットもできません
+- 解析の途中で AviUtl2 を終了しても大丈夫です（v0.1.0 では、解析中に終了すると落ちることがありました）
 - 対象は**表示中のシーン**だけです
 - 重要なプロジェクトは、試す前にコピーを取っておいてください

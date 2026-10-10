@@ -8,7 +8,7 @@
 [project]
 id = "HexBrowns.LayerSilenceCut_H"
 name = "LayerSilenceCut_H"
-version = "0.1.1"
+version = "0.1.2"
 
 [artifacts."LayerSilenceCut_H.aux2"]
 build = "cargo build --release"

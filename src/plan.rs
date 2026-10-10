@@ -65,6 +65,79 @@ pub fn action_for(cuts: &[Range<usize>], start: usize, end: usize) -> Action {
     }
 }
 
+/// 処理した後にオブジェクトが占める範囲（両端を含む）。`Delete` は空
+pub fn target_ranges(action: &Action, start: usize, end: usize) -> Vec<(usize, usize)> {
+    match action {
+        Action::Keep => vec![(start, end)],
+        Action::Move { to } => vec![(*to, to + end - start)],
+        Action::Delete => vec![],
+        Action::Split { pieces } => pieces.iter().map(|p| (p.new_start, p.new_start + p.end - p.start)).collect(),
+    }
+}
+
+/// 置き場所がふさがっている（`check_layer` の失敗）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// 処理しようとしたオブジェクトの元の範囲
+    pub object: (usize, usize),
+    /// 置こうとした範囲
+    pub target: (usize, usize),
+    /// その範囲にかかっているもの
+    pub by: (usize, usize),
+}
+
+fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
+/// 1 つのレイヤーのオブジェクト（開始順、両端を含む）を左から順に処理したとき、
+/// 動かす先・作り直す先が毎回空いているかを確かめる（何かを変える前に呼ぶ）。
+///
+/// 処理する時点で、左のものは処理後の位置、自分より右のものは元の位置にある。
+/// 自分の元の範囲は空いているとみなす（動かす・消してから作り直す）。
+pub fn check_layer(objects: &[(usize, usize)], cuts: &[Range<usize>]) -> Result<(), Blocked> {
+    let mut placed: Vec<(usize, usize)> = Vec::new();
+    for (i, &(s, e)) in objects.iter().enumerate() {
+        let targets = target_ranges(&action_for(cuts, s, e), s, e);
+        for (k, &t) in targets.iter().enumerate() {
+            let others = placed.iter().chain(&objects[i + 1..]).chain(&targets[..k]);
+            if let Some(&by) = others.into_iter().find(|&&o| overlaps(o, t)) {
+                return Err(Blocked { object: (s, e), target: t, by });
+            }
+        }
+        placed.extend(targets);
+    }
+    Ok(())
+}
+
+/// レイヤーを左から辿り、`target`（両端を含む）にかかる最初のオブジェクトの範囲を返す。`skip` の範囲のものは数えない
+/// （同じレイヤーのオブジェクトは重ならないので、範囲でオブジェクトが決まる）。
+///
+/// `find(from)` は `find_object_after(layer, from)` で見つけたオブジェクトの範囲。SDK（`plugin2.h` の `find_object`）の
+/// 説明は「指定のフレーム番号以降にあるオブジェクトを検索」だけで、開始が `from` より前にあって `from` にかかる
+/// オブジェクトを返すかは書かれていない（aviutl2-rs 0.48 も素通し）。どちらでも漏れないように、先頭（0）から辿る。
+pub fn first_overlap(
+    mut find: impl FnMut(usize) -> Option<(usize, usize)>,
+    target: (usize, usize),
+    skip: (usize, usize),
+) -> Option<(usize, usize)> {
+    let mut from = 0;
+    loop {
+        let (s, e) = find(from)?;
+        if s > target.1 {
+            return None;
+        }
+        if (s, e) != skip && e >= target.0 {
+            return Some((s, e));
+        }
+        if e < from {
+            // 先へ進まない（起きないはず）。空いているとは言い切れないので、かかっているとみなす
+            return Some((s, e));
+        }
+        from = e + 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,19 +187,55 @@ mod tests {
         for cuts in cut_sets {
             let mut placed: Vec<(usize, usize)> = Vec::new();
             for &(s, e) in &objects {
-                let ranges: Vec<(usize, usize)> = match action_for(&cuts, s, e) {
-                    Action::Keep => vec![(s, e)],
-                    Action::Move { to } => vec![(to, to + e - s)],
-                    Action::Delete => vec![],
-                    Action::Split { pieces } => pieces.iter().map(|p| (p.new_start, p.new_start + p.end - p.start)).collect(),
-                };
-                for r in ranges {
+                for r in target_ranges(&action_for(&cuts, s, e), s, e) {
                     if let Some(last) = placed.last() {
                         assert!(r.0 > last.1, "{cuts:?}: {r:?} が {last:?} と重なる");
                     }
                     placed.push(r);
                 }
             }
+            // 左から順に処理する途中でも、置く先は毎回空いている
+            assert_eq!(check_layer(&objects, &cuts), Ok(()), "{cuts:?}");
+        }
+    }
+
+    #[test]
+    fn check_layer_reports_blocked_target() {
+        // 並びが想定と違う（右のものが先に来た）と、動かす先に元の位置のオブジェクトが残っている
+        let cuts = [0..5];
+        assert_eq!(
+            check_layer(&[(20, 29), (5, 15)], &cuts),
+            Err(Blocked { object: (20, 29), target: (15, 24), by: (5, 15) })
+        );
+        // 分割のピースが、まだ動かしていない右のオブジェクトにかかる
+        let cuts = [10..12];
+        assert_eq!(
+            check_layer(&[(0, 30), (25, 40)], &cuts),
+            Err(Blocked { object: (0, 30), target: (10, 28), by: (25, 40) })
+        );
+        assert_eq!(check_layer(&[], &cuts), Ok(()));
+    }
+
+    /// 同じレイヤーの並び（開始順）に対する `find_object_after` の 2 通りの解釈
+    fn finder(objects: &'static [(usize, usize)], covering: bool) -> impl FnMut(usize) -> Option<(usize, usize)> {
+        move |from| objects.iter().copied().find(|&(s, e)| if covering { e >= from } else { s >= from })
+    }
+
+    #[test]
+    fn first_overlap_on_the_timeline() {
+        const OBJECTS: &[(usize, usize)] = &[(0, 9), (20, 40), (50, 60)];
+        const NONE: (usize, usize) = (usize::MAX, usize::MAX);
+        for covering in [false, true] {
+            // 開始が前にあって範囲にかかる
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (30, 35), NONE), Some((20, 40)), "covering={covering}");
+            // 端が接するだけでも重なる（両端を含む）
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (45, 50), NONE), Some((50, 60)), "covering={covering}");
+            // 隙間
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (10, 19), NONE), None, "covering={covering}");
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (61, 99), NONE), None, "covering={covering}");
+            // 自分（これから消す元）は数えない。その先にかかるものは拾う
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (25, 35), (20, 40)), None, "covering={covering}");
+            assert_eq!(first_overlap(finder(OBJECTS, covering), (15, 55), (20, 40)), Some((50, 60)), "covering={covering}");
         }
     }
 }

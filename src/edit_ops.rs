@@ -300,10 +300,30 @@ pub fn cut(expected: u64, analysis_layers: Vec<usize>, cut_layers: Vec<usize>, c
             if fingerprint(edit, &layers) != expected {
                 return Err("解析した後にタイムラインが変わりました。解析し直してください（何も変えていません）".into());
             }
-            let mut rep = CutReport::default();
+            // 何かを変える前に、全部のレイヤーで、動かす先・作り直す先が処理する時点で空いているかを確かめる
+            // （分割は元を消してから作り直すので、置けないと分かってから止めても元が消えている）
+            let mut planned = Vec::new();
             for &layer in &cut_layers {
+                let objects = objects_in(edit, layer);
+                let ranges: Vec<(usize, usize)> = objects.iter().map(|&(_, s, e)| (s, e)).collect();
+                if let Err(b) = plan::check_layer(&ranges, &cuts) {
+                    return Err(format!(
+                        "{} レイヤー目の {}〜{} を {}〜{} に置けません（{}〜{} に別のオブジェクトがあります）。何も変えていません",
+                        layer + 1,
+                        b.object.0,
+                        b.object.1,
+                        b.target.0,
+                        b.target.1,
+                        b.by.0,
+                        b.by.1
+                    ));
+                }
+                planned.push((layer, objects));
+            }
+            let mut rep = CutReport::default();
+            for (layer, objects) in planned {
                 // 左から順に処理する（plan.rs。動かす先は必ず空いている）
-                for (h, s, e) in objects_in(edit, layer) {
+                for (h, s, e) in objects {
                     let fail = |what: &str, err: String| {
                         format!("{} レイヤー目の {s}〜{e} を{what}できませんでした: {err}。Ctrl+Z で切る前に戻せます", layer + 1)
                     };
@@ -325,10 +345,37 @@ pub fn cut(expected: u64, analysis_layers: Vec<usize>, cut_layers: Vec<usize>, c
                                 .map(|p| split::piece_alias(&raw, p.start, p.end, &src).map(|a| (a, *p)))
                                 .collect::<Result<Vec<_>, _>>()
                                 .map_err(|x| fail("分割", x))?;
+                            // 元を消す前に、ピースを置く場所が今のタイムラインで空いているかを確かめる（元の自分は数えない）
+                            for (_, p) in &aliases {
+                                let target = (p.new_start, p.new_start + p.end - p.start);
+                                let by = plan::first_overlap(
+                                    |from| {
+                                        let o = edit.find_object_after(layer, from).ok().flatten()?;
+                                        edit.get_object_layer_frame(o).ok().map(|f| (f.start, f.end))
+                                    },
+                                    target,
+                                    (s, e),
+                                );
+                                if let Some((bs, be)) = by {
+                                    return Err(fail(
+                                        "分割",
+                                        format!("置く先の {}〜{} に別のオブジェクト（{bs}〜{be}）があります（このオブジェクトは消していません）", target.0, target.1),
+                                    ));
+                                }
+                            }
                             edit.delete_object(h).map_err(|x| fail("分割（元を消す）", x.to_string()))?;
-                            for (alias, p) in aliases {
+                            let total = aliases.len();
+                            for (k, (alias, p)) in aliases.into_iter().enumerate() {
                                 let len = p.end - p.start + 1;
-                                let made = edit.create_object_from_alias(&alias, layer, p.new_start, len).map_err(|x| fail("分割（置き直す）", x.to_string()))?;
+                                let made = edit.create_object_from_alias(&alias, layer, p.new_start, len).map_err(|x| {
+                                    format!(
+                                        "{} レイヤー目の {s}〜{e} を分割する途中で、{}/{total} 個目のピース（{}〜{}）を作れませんでした: {x}。元のオブジェクトは消えていて、作れたピースは {k} 個です。Ctrl+Z で切る前に戻せます",
+                                        layer + 1,
+                                        k + 1,
+                                        p.new_start,
+                                        p.new_start + len - 1
+                                    )
+                                })?;
                                 if let Ok(lf) = edit.get_object_layer_frame(made) {
                                     if (lf.start, lf.end) != (p.new_start, p.new_start + len - 1) {
                                         tracing::warn!(

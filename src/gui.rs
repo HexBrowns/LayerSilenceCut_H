@@ -26,6 +26,8 @@ pub struct App {
     analysis: BTreeMap<usize, String>,
     cut: BTreeMap<usize, String>,
     settings: Settings,
+    /// 変えたがまだ保存していない（ドラッグ中）
+    settings_dirty: bool,
     prepared: Option<Arc<Prepared>>,
     progress: Option<Arc<Progress>>,
     levels: Option<Levels>,
@@ -34,6 +36,33 @@ pub struct App {
     status: String,
     status_is_error: bool,
     first_scan_done: bool,
+}
+
+/// 設定値の欄（ルール au2-rs-plugin「入力の確定と取り消し」）。
+/// 打っている途中の値は使わず、Enter かほかをクリックしてフォーカスが外れたときに確定する。入力中の Esc は入力前の値に戻す。
+/// ドラッグで変えた値はその場で使う。
+///
+/// egui 0.36.2 の `DragValue` は `update_while_editing(false)` でも、Esc の次のフレームで打った文字を値にしてしまう
+/// （フォーカスを失ったとみなす期間が 2 フレームあり、2 フレーム目には Esc が押されていないため）。
+/// Esc のフレームの値を覚えておき、次のフレームで戻す
+fn setting_value(ui: &mut egui::Ui, value: &mut f64, range: (f64, f64), speed: f64, suffix: &str) -> egui::Response {
+    let resp = ui.add(
+        egui::DragValue::new(value)
+            .range(range.0..=range.1)
+            .speed(speed)
+            .suffix(suffix)
+            .update_while_editing(false),
+    );
+    let key = resp.id.with("escaped");
+    let pass = ui.ctx().cumulative_pass_nr();
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(key, (pass, *value)));
+    } else if let Some((at, before)) = ui.data_mut(|d| d.remove_temp::<(u64, f64)>(key)) {
+        if pass == at + 1 {
+            *value = before;
+        }
+    }
+    resp
 }
 
 /// フレーム数を「分:秒.小数」にする
@@ -54,6 +83,7 @@ impl App {
             analysis: BTreeMap::new(),
             cut: BTreeMap::new(),
             settings: Settings::load(),
+            settings_dirty: false,
             prepared: None,
             progress: None,
             levels: None,
@@ -235,21 +265,22 @@ impl App {
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         let before = self.settings;
+        let mut dragging = false;
         egui::Grid::new("settings").spacing([10.0, 4.0]).show(ui, |ui| {
             let s = &mut self.settings;
             ui.label("① 無音判定基準").on_hover_text("この音量以下を無音、これを超える音を有音とみなします。小さい声が切れるときは小さくします");
-            ui.add(egui::DragValue::new(&mut s.threshold_db).range(detect::THRESHOLD_RANGE.0..=detect::THRESHOLD_RANGE.1).speed(0.5).suffix(" dB"));
+            dragging |= setting_value(ui, &mut s.threshold_db, detect::THRESHOLD_RANGE, 0.5, " dB").dragged();
             ui.end_row();
             ui.label("② 最短無音時間").on_hover_text("これより短い無音は切らずに残します（自然な間を保つため）");
-            ui.add(egui::DragValue::new(&mut s.min_silence_ms).range(detect::MIN_SILENCE_RANGE.0..=detect::MIN_SILENCE_RANGE.1).speed(10.0).suffix(" ms"));
+            dragging |= setting_value(ui, &mut s.min_silence_ms, detect::MIN_SILENCE_RANGE, 10.0, " ms").dragged();
             ui.end_row();
             ui.label("③ 最短有音時間").on_hover_text(
                 "前後が最短無音時間以上の無音に挟まれた、これより短い音を無音とみなします（リップノイズやクリック音を残さないため）。0 で無効",
             );
-            ui.add(egui::DragValue::new(&mut s.min_voiced_ms).range(detect::MIN_VOICED_RANGE.0..=detect::MIN_VOICED_RANGE.1).speed(5.0).suffix(" ms"));
+            dragging |= setting_value(ui, &mut s.min_voiced_ms, detect::MIN_VOICED_RANGE, 5.0, " ms").dragged();
             ui.end_row();
             ui.label("④ 有音区間拡張").on_hover_text("有音の前後に残す無音の長さ。話し始め・話し終わりが切れるときは長くします");
-            ui.add(egui::DragValue::new(&mut s.padding_ms).range(detect::PADDING_RANGE.0..=detect::PADDING_RANGE.1).speed(5.0).suffix(" ms"));
+            dragging |= setting_value(ui, &mut s.padding_ms, detect::PADDING_RANGE, 5.0, " ms").dragged();
             ui.end_row();
         });
         ui.horizontal(|ui| {
@@ -265,7 +296,13 @@ impl App {
         }
         if self.settings != before {
             self.settings = Settings::from_params(self.settings.params());
+            self.settings_dirty = true;
+        }
+        // ドラッグで値を変えている間は書き込まない（離したフレームで 1 回だけ保存する）。
+        // カットの確認はドラッグ中も今の値で描き直す
+        if self.settings_dirty && !dragging {
             self.settings.save();
+            self.settings_dirty = false;
         }
     }
 
@@ -389,5 +426,83 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| self.render_layers(ui));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 設定値の欄を egui だけで動かし、打っている途中の値が使われないこと・Esc で戻ることを確かめる
+
+    use super::*;
+
+    /// テストの 1 フレームの出力を捨てる。テクスチャの差分を片付けずに捨てると、デバッグビルドで epaint の debug_assert
+    /// （Dropped TexturesDelta with N unapplied deltas）が落ちる（au2 release の prebuild の cargo test はデバッグビルド）
+    fn discard_frame(mut out: egui::FullOutput) {
+        out.textures_delta.clear();
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// 1 フレーム描く。`focus` なら描く前に欄へフォーカスを移す（クリックしたときと同じく全選択で編集に入る）
+    fn frame(ctx: &egui::Context, value: &mut f64, id: Option<egui::Id>, focus: bool, events: Vec<egui::Event>) -> egui::Id {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = egui::Id::NULL;
+        discard_frame(ctx.run_ui(input, |ui| {
+            if let (true, Some(id)) = (focus, id) {
+                ui.memory_mut(|m| m.request_focus(id));
+            }
+            out = setting_value(ui, value, detect::PADDING_RANGE, 5.0, " ms").id;
+        }));
+        out
+    }
+
+    /// 100 の欄に "250" を打ったところまで進める
+    fn typed(ctx: &egui::Context, v: &mut f64) -> egui::Id {
+        let id = frame(ctx, v, None, false, vec![]);
+        frame(ctx, v, Some(id), true, vec![]);
+        frame(ctx, v, Some(id), false, vec![egui::Event::Text("250".into())]);
+        id
+    }
+
+    #[test]
+    fn typed_value_is_used_only_after_enter() {
+        let ctx = egui::Context::default();
+        let mut v = 100.0;
+        let id = typed(&ctx, &mut v);
+        assert_eq!(v, 100.0, "打っている途中の値を使っている");
+        frame(&ctx, &mut v, Some(id), false, vec![key(egui::Key::Enter)]);
+        frame(&ctx, &mut v, Some(id), false, vec![]);
+        assert_eq!(v, 250.0);
+    }
+
+    #[test]
+    fn value_is_committed_when_focus_moves_away() {
+        let ctx = egui::Context::default();
+        let mut v = 100.0;
+        let id = typed(&ctx, &mut v);
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        for _ in 0..3 {
+            frame(&ctx, &mut v, Some(id), false, vec![]);
+        }
+        assert_eq!(v, 250.0);
+    }
+
+    #[test]
+    fn escape_restores_value_before_typing() {
+        let ctx = egui::Context::default();
+        let mut v = 100.0;
+        let id = typed(&ctx, &mut v);
+        frame(&ctx, &mut v, Some(id), false, vec![key(egui::Key::Escape)]);
+        // egui はフォーカスを失った後の 2 フレームを「失った」とみなすので、続けて数フレーム描いても戻らないこと
+        for _ in 0..3 {
+            frame(&ctx, &mut v, Some(id), false, vec![]);
+        }
+        assert_eq!(v, 100.0);
     }
 }
